@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/buildkite/agent/v3/api"
+	"github.com/buildkite/agent/v3/bootstrap/shell"
 	"github.com/buildkite/agent/v3/experiments"
+	"github.com/buildkite/agent/v3/hook"
 	"github.com/buildkite/agent/v3/logger"
 	"github.com/buildkite/agent/v3/metrics"
 	"github.com/buildkite/agent/v3/process"
@@ -283,30 +285,57 @@ func (r *JobRunner) Run() error {
 	signal := ""
 	signalReason := ""
 
-	// Run the process. This will block until it finishes.
-	if err := r.process.Run(); err != nil {
-		// Send the error as output
-		r.logStreamer.Process(fmt.Sprintf("%s", err))
+	// Before executing the bootstrap process with the received Job env,
+	// execute the pre-bootstrap hook (if present) for it to tell us
+	// whether it is happy to proceed.
+	environmentCommandOkay := true
 
-		// The process did not run at all, so make sure it fails
-		exitStatus = "-1"
-		signalReason = "process_run_error"
-	} else {
-		// Add the final output to the streamer
-		r.logStreamer.Process(r.output.String())
+	if hook, _ := hook.Find(r.conf.AgentConfiguration.HooksPath, "pre-bootstrap"); hook != "" {
+		// Once we have a hook any failure to run it MUST be fatal to the job to guarantee a true
+		// positive result from the hook
+		okay, err := r.executePreBootstrapHook(hook)
+		if !okay {
+			environmentCommandOkay = false
 
-		// Collect the finished process' exit status
-		exitStatus = fmt.Sprintf("%d", r.process.WaitStatus().ExitStatus())
-		if ws := r.process.WaitStatus(); ws.Signaled() {
-			signal = process.SignalString(ws.Signal())
+			// Ensure the Job UI knows why this job resulted in failure
+			r.logStreamer.Process("pre-bootstrap hook rejected this job, see the buildkite-agent logs for more details")
+			// But disclose more information in the agent logs
+			r.logger.Error("pre-bootstrap hook rejected this job: %s", err)
+
+			exitStatus = "-1"
+
+			// TODO swap the signal reason once buildkite.com supports this enum value
+			// signalReason = "agent_refused"
+			signalReason = ""
 		}
-		if r.stopped {
-			// The agent is being gracefully stopped, and we signaled the job to end. Often due
-			// to pending host shutdown or EC2 spot instance termination
-			signalReason = `agent_stop`
-		} else if r.cancelled {
-			// The job was signaled because it was cancelled via the buildkite web UI
-			signalReason = `cancel`
+	}
+
+	if environmentCommandOkay {
+		// Run the process. This will block until it finishes.
+		if err := r.process.Run(); err != nil {
+			// Send the error as output
+			r.logStreamer.Process(fmt.Sprintf("%s", err))
+
+			// The process did not run at all, so make sure it fails
+			exitStatus = "-1"
+			signalReason = "process_run_error"
+		} else {
+			// Add the final output to the streamer
+			r.logStreamer.Process(r.output.String())
+
+			// Collect the finished process' exit status
+			exitStatus = fmt.Sprintf("%d", r.process.WaitStatus().ExitStatus())
+			if ws := r.process.WaitStatus(); ws.Signaled() {
+				signal = process.SignalString(ws.Signal())
+			}
+			if r.stopped {
+				// The agent is being gracefully stopped, and we signaled the job to end. Often due
+				// to pending host shutdown or EC2 spot instance termination
+				signalReason = `agent_stop`
+			} else if r.cancelled {
+				// The job was signaled because it was cancelled via the buildkite web UI
+				signalReason = `cancel`
+			}
 		}
 	}
 
@@ -592,6 +621,40 @@ func truncateEnv(l logger.Logger, env map[string]string, key string, max int) er
 	env[key] = env[key][0:keeplen] + apology
 	l.Warn("%s %s", key, description)
 	return nil
+}
+
+type LogWriter struct {
+	l logger.Logger
+}
+
+func (w LogWriter) Write(bytes []byte) (int, error) {
+	w.l.Info("%s", bytes)
+	return len(bytes), nil
+}
+
+func (r *JobRunner)executePreBootstrapHook(hook string) (bool, error) {
+	r.logger.Info("Running pre-bootstrap hook %q", hook)
+
+	sh, err := shell.New()
+	if err != nil {
+		return false, err
+	}
+
+	// This (plus inherited) is the only ENV that should be exposed
+	// to the pre-bootstrap hook.
+	sh.Env.Set("BUILDKITE_ENV_FILE", r.envFile.Name())
+
+	sh.Writer = LogWriter {
+		l: r.logger,
+	}
+
+	if err := sh.RunWithoutPrompt(hook); err != nil {
+		r.logger.Error("Finished pre-bootstrap hook %q: job rejected", hook)
+		return false, err
+	}
+
+	r.logger.Info("Finished pre-bootstrap hook %q: job accepted", hook)
+	return true, nil
 }
 
 // Starts the job in the Buildkite Agent API. We'll retry on connection-related
